@@ -1,116 +1,152 @@
 import express from 'express';
 import debug from 'debug';
-const debugBook = debug('app:book');
-
+const debugBook = debug('app:Book');
+import { connect, getBooks, getBookById, updateBook, addBook, deleteBook, saveEdit } from '../../database.js';
+import { validId } from '../../middleware/validId.js';
+import { validBody } from '../../middleware/validBody.js';
+import Joi from 'joi';
+import { isLoggedIn, hasPermission } from "@merlin4/express-auth";
 const router = express.Router();
-const books = [{
-  "title": "Big Bang Love, Juvenile A (46-okunen no koi)",
-  "author": "Delcine Durrant",
-  "publication_date": "6/19/1980",
-  "genre": "fiction",
-  "_id": 1
-}, {
-  "title": "009 Re: Cyborg",
-  "author": "Westley Studeart",
-  "publication_date": "11/26/1955",
-  "genre": "non-fiction",
-  "_id": 2
-}, {
-  "title": "Short Time",
-  "author": "Kaylee Trench",
-  "publication_date": "9/6/1958",
-  "genre": "non-fiction",
-  "_id": 3
-}, {
-  "title": "Apocalypto",
-  "author": "Elyse Aldwick",
-  "publication_date": "1/7/2004",
-  "genre": "non-fiction",
-  "_id": 4
-}, {
-  "title": "Mulan",
-  "author": "Barri Pithcock",
-  "publication_date": "1/26/1949",
-  "genre": "mystery",
-  "_id": 5
-}];
 
+const newBookSchema = Joi.object({
+    isbn:Joi.string().trim().min(14).required(),
+    title:Joi.string().trim().min(1).required(),
+    author:Joi.string().trim().min(1).required(),
+    genre:Joi.string().valid('Fiction', 'Magical Realism', 'Dystopian', 'Mystery', 'Young Adult', 'Non-Fiction').required(),
+    publication_year:Joi.number().integer().min(1900).max(2023).required(),
+    price:Joi.number().min(0).required(),
+    description:Joi.string().trim().min(1).required(),
+});
+
+const updateBookSchema = Joi.object({
+    isbn:Joi.string().trim().min(14),
+    title:Joi.string().trim().min(1),
+    author:Joi.string().trim().min(1),
+    genre:Joi.string().valid('Fiction', 'Magical Realism', 'Dystopian', 'Mystery', 'Young Adult', 'Non-Fiction'),
+    publication_year:Joi.number().integer().min(1900).max(2023),
+    price:Joi.number().min(0),
+    description:Joi.string().trim().min(1),
+})
 
 //get all books
-router.get('/list', (req,res) => {
-  debugBook('Getting all books');
-  res.status(200).json(books);
+router.get('/list', isLoggedIn(), async (req,res) => {
+    debugBook(`The req.auth property is: ${JSON.stringify(req.auth)}`);
+
+    let {keywords, minPrice, maxPrice, genre, sortBy} = req.query;
+    const match = {}; //match stage of the aggregation pipeline is the filter
+    const sort = {author:1};
+
+    try{
+        // const db = await connect();
+        // const books = await getBooks();
+        // res.status(200).json(books);
+        if(keywords){
+            match.$text = {$search: keywords};
+        }
+
+        if(genre){
+            match.genre = {$eq: genre};
+        }
+
+        if(minPrice && maxPrice){
+            match.price = {$gte: parseFloat(minPrice), $lte: parseFloat(maxPrice)};
+        }else if(minPrice){
+            match.price = {$gte: parseFloat(minPrice)};
+        }else if(maxPrice){
+            match.price = {$lte: parseFloat(maxPrice)};
+        }
+        
+        switch(sortBy){
+            case 'price': sort.price = 1; break;
+        }
+
+        const pipeline = [
+            {$match: match},
+            {$sort: sort}
+        ];
+
+        const db = await connect();
+        const cursor = await db.collection('Book').aggregate(pipeline);
+        const books = await cursor.toArray();
+        res.status(200).json(books);
+    } catch(err) {
+        res.status(500).json({error: err.stack});
+  }
 });
 
 //get a book by the id
-router.get('/:id', (req, res) => {
-  const id = req.params.id;
-  const book = books.find(book => book._id == id);
-  if(book){
-    res.status(200).send(book);
-  } else {
-    res.status(404).send({message: `Book ${id} not found`});
-  }
-  
+router.get('/:id', isLoggedIn(), validId('id'), async (req, res) => {
+    const id = req.params.id;
+    try{
+        const book = await getBookById(id);
+        if(book){
+            res.status(200).json({book});
+        }else{
+            res.status(404).json({message: `Book ${id} not found`});
+        }
+    } catch(err) {
+        res.status(500).json({error: err.stack});
+    }
 });
 
 //update a book by the id
 //update can use a put or a post
-router.put('/:id', (req,res) => {
-  const id = req.params.id;
-  const currentBook = books.find(book => book._id == id);
-  //for this line to work, you have to have a body parser
-  const updatedBook = req.body;
-
-  if(currentBook){
-    for(const key in updatedBook){
-      if(currentBook[key] != updatedBook[key]){
-        currentBook[key] = updatedBook[key];
+router.put('/update/:id', isLoggedIn(), validId('id'), validBody(updateBookSchema), async (req,res) => {
+    const id = req.id;
+    const updatedBook = req.body;
+    if(updatedBook.price){
+        updatedBook.price = parseFloat(updatedBook.price);
+    }
+    try {
+      const updateResult = await updateBook(id, updatedBook);
+      if(updateResult.modifiedCount == 1){
+        const edit = {
+            timestamp: new Date(),
+            op:'Update Book',
+            collection: 'Book',
+            targetUser: id,
+            auth:req.auth
+        }
+        await saveEdit(edit);
+          res.status(200).json({message: `Book ${id} is updated`});
+      } else {
+          res.status(400).json({message: `Book ${id} not updated`});
       }
+    } catch(err) {
+          res.status(500).json({error: err.stack});
     }
-
-    //save the currentBook back into the array
-    const index = books.findIndex(book => book._id == id);
-    if(index != -1){
-      books[index] = currentBook;
-    }
-    res.status(200).send(`Book ${id} updated`);
-  } else {
-    res.status(404).send({message: `Book ${id} not found`});
-  }
-
-  res.json(updatedBook);
 });
 
 //add a new book to the array
-router.post('/add', (req,res) => {
-  const newBook = req.body;
-  //if new book is not empty object
-  
-  if(newBook){
-    //add a unique id
-    const id = books.length + 1;
-    newBook._id = id;
-    //add the book to the array
-    books.push(newBook);
-    res.status(200).json({message: `Book ${newBook.title} added`});
-  } else {
-    res.status(400).json({message: `Error in adding book`});
-  }
+router.post('/add', isLoggedIn(), validBody(newBookSchema), async (req,res) => {
+    const newBook = req.body;
+   
+    try{
+        const dbResult = await addBook(newBook);
+        if(dbResult.acknowledged == true){
+            res.status(200).json({message: `Book ${newBook.title} added with an id of ${dbResult.insertedId}`});
+        } else {
+            res.status(400).json({message: `Book ${newBook.title} not added`});
+        }
+    } catch(err) {
+        res.status(500).json({error: err.stack});
+    }
 });
 
-//delete a book by the id
-router.delete('/:id',(req,res) => {
-  //gets the id from the URL
-  const id = req.params.id;
-  //find the index of the book in the array
-  const index = books.findIndex(book => book._id == id);
-  if(index != -1){
-    books.splice(index,1);
-    res.status(200).json({message:`Book ${id} deleted`});
-  } else {
-    res.status(404).json({message: `Book ${id} not found`});
+router.delete('/delete/:bookId', isLoggedIn(), validId('bookId'), async (req,res) => {
+  const id = req.bookId;
+
+  const dbResult = await deleteBook(id);
+
+  try{
+      if(dbResult.deletedCount == 1){
+          res.status(200).json({message: `Book ${id} deleted`});
+      } else {
+          res.status(400).json({message: `Book ${id} not deleted`})
+      }
+  } catch(err) {
+      res.status(500).json({error: err.stack});
   }
-});
+})
 
 export {router as BookRouter};
